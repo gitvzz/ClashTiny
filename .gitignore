@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+docs
+
+# Rust / Cargo
+**/target/
+
+# Tauri generated schemas
+src-tauri/gen/schemas/
+
+# Sidecar binaries (mihomo)
+src-tauri/bin/
+
+# Helper compiled binary
+helper/clash-tiny-helper
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Deprecated scripts
+src-tauri/scripts/subscription_dialog.swift
+
+# AI-generated base images (intermediate artifacts)
+scripts/tray-base-*.png
+scripts/preview-*.png
