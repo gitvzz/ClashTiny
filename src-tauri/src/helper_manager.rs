@@ -39,11 +39,13 @@ pub fn install_helper() -> Result<(), String> {
     let plist_src = find_helper_plist()?;
     let install_script = find_install_script()?;
 
+    // #9: escape single quotes to prevent shell injection via paths
+    let esc = |p: &Path| p.to_string_lossy().replace('\'', "'\\''");
     let script = format!(
         r#"do shell script "bash '{}' '{}' '{}'" with administrator privileges"#,
-        install_script.to_string_lossy(),
-        helper_src.to_string_lossy(),
-        plist_src.to_string_lossy(),
+        esc(&install_script),
+        esc(&helper_src),
+        esc(&plist_src),
     );
 
     let output = Command::new("osascript")
@@ -69,9 +71,10 @@ pub fn install_helper() -> Result<(), String> {
 pub fn uninstall_helper() -> Result<(), String> {
     let uninstall_script = find_uninstall_script()?;
 
+    let esc = |p: &Path| p.to_string_lossy().replace('\'', "'\\''");
     let script = format!(
         r#"do shell script "bash '{}'" with administrator privileges"#,
-        uninstall_script.to_string_lossy(),
+        esc(&uninstall_script),
     );
 
     let output = Command::new("osascript")

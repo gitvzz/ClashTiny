@@ -6,6 +6,7 @@ use std::process::{Child, Command};
 use std::sync::Mutex;
 
 const SOCKET_PATH: &str = "/var/run/clash-tiny-helper.sock";
+const ALLOWED_BIN_PREFIX: &str = "mihomo";
 
 static CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
@@ -39,15 +40,27 @@ fn main() {
         }
     };
 
-    // Allow the main app (non-root) to connect
-    let _ = Command::new("chmod").args(["777", SOCKET_PATH]).status();
+    // Restrict socket to owner (root) + group (staff) only — no world access
+    let _ = Command::new("chmod").args(["770", SOCKET_PATH]).status();
+    // Allow members of 'staff' group (all normal macOS users) to connect
+    let _ = Command::new("chown").args(["root:staff", SOCKET_PATH]).status();
 
     println!("[Helper] Listening on {SOCKET_PATH}");
 
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                let reader = BufReader::new(stream.try_clone().unwrap());
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .ok();
+                let cloned = match stream.try_clone() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[Helper] stream clone failed: {e}");
+                        continue;
+                    }
+                };
+                let reader = BufReader::new(cloned);
                 for line in reader.lines() {
                     let line = match line {
                         Ok(l) => l,
@@ -59,6 +72,7 @@ fn main() {
                     let resp = handle_request(&line);
                     let json = serde_json::to_string(&resp).unwrap_or_default();
                     let _ = writeln!(stream, "{json}");
+                    break; // one request per connection
                 }
             }
             Err(e) => eprintln!("[Helper] Connection error: {e}"),
@@ -90,8 +104,16 @@ fn cmd_start(req: Request) -> Response {
         _ => return Response { code: 1, message: "Missing config_dir".into() },
     };
 
-    if !Path::new(&bin_path).exists() {
+    let bin = Path::new(&bin_path);
+    if !bin.exists() {
         return Response { code: 1, message: format!("Binary not found: {bin_path}") };
+    }
+    let fname = bin.file_name().unwrap_or_default().to_string_lossy();
+    if !fname.starts_with(ALLOWED_BIN_PREFIX) {
+        return Response {
+            code: 1,
+            message: format!("Rejected: binary name '{}' not allowed", fname),
+        };
     }
 
     // Stop existing process first
@@ -100,7 +122,7 @@ fn cmd_start(req: Request) -> Response {
     match Command::new(&bin_path).args(["-d", &config_dir]).spawn() {
         Ok(child) => {
             let pid = child.id();
-            *CHILD.lock().unwrap() = Some(child);
+            *CHILD.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
             println!("[Helper] Mihomo started (pid: {pid})");
             Response { code: 0, message: format!("Started pid={pid}") }
         }
@@ -114,18 +136,29 @@ fn cmd_stop() -> Response {
 }
 
 fn cmd_status() -> Response {
-    let guard = CHILD.lock().unwrap();
-    match &*guard {
-        Some(child) => Response {
-            code: 0,
-            message: format!("Running pid={}", child.id()),
+    let mut guard = CHILD.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_mut() {
+        Some(child) => match child.try_wait() {
+            Ok(Some(status)) => {
+                let msg = format!("Exited with {}", status);
+                guard.take();
+                Response { code: 0, message: msg }
+            }
+            Ok(None) => Response {
+                code: 0,
+                message: format!("Running pid={}", child.id()),
+            },
+            Err(_) => {
+                guard.take();
+                Response { code: 0, message: "Not running".into() }
+            }
         },
         None => Response { code: 0, message: "Not running".into() },
     }
 }
 
 fn stop_child() {
-    let mut guard = CHILD.lock().unwrap();
+    let mut guard = CHILD.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut child) = guard.take() {
         let _ = child.kill();
         let _ = child.wait();

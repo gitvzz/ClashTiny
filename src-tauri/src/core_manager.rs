@@ -1,10 +1,20 @@
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tauri::Manager;
 
 const API_BASE: &str = "http://127.0.0.1:9090";
 const API_SECRET: &str = "ClashTiny";
+
+fn api_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("failed to build HTTP client")
+    })
+}
 
 pub struct CoreState {
     pub child: Mutex<Option<Child>>,
@@ -18,13 +28,8 @@ impl CoreState {
     }
 }
 
-/// Get Mihomo version string from the API, e.g. "Mihomo Meta v1.18.0".
 pub fn get_mihomo_version() -> Option<String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .ok()?;
-    let resp = client
+    let resp = api_client()
         .get(format!("{API_BASE}/version"))
         .header("Authorization", format!("Bearer {API_SECRET}"))
         .send()
@@ -42,20 +47,13 @@ pub fn get_mihomo_version() -> Option<String> {
     }
 }
 
-/// Check if Mihomo API is responding (regardless of who started it).
 pub fn is_api_healthy() -> bool {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build();
-    match client {
-        Ok(c) => c
-            .get(format!("{API_BASE}/version"))
-            .header("Authorization", format!("Bearer {API_SECRET}"))
-            .send()
-            .map(|r| r.status().is_success())
-            .unwrap_or(false),
-        Err(_) => false,
-    }
+    api_client()
+        .get(format!("{API_BASE}/version"))
+        .header("Authorization", format!("Bearer {API_SECRET}"))
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
 }
 
 /// Wait for Mihomo API to become responsive after startup.
@@ -72,34 +70,18 @@ pub fn wait_until_healthy(max_attempts: u32, interval_ms: u64) -> bool {
     false
 }
 
-fn find_mihomo_bin(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+pub fn find_mihomo_bin(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    if let Ok(p) = crate::config::find_mihomo_bin_path() {
+        return Ok(p);
+    }
     let arch = std::env::consts::ARCH;
     let sidecar_name = format!("mihomo-{}-apple-darwin", arch);
-
-    let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("bin")
-        .join(&sidecar_name);
-    if dev_path.exists() {
-        return Ok(dev_path);
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        let real_exe = exe.canonicalize().unwrap_or(exe);
-        if let Some(dir) = real_exe.parent() {
-            let prod_path = dir.join(&sidecar_name);
-            if prod_path.exists() {
-                return Ok(prod_path);
-            }
-        }
-    }
-
     if let Ok(resource_dir) = app.path().resource_dir() {
         let res_path = resource_dir.join(&sidecar_name);
         if res_path.exists() {
             return Ok(res_path);
         }
     }
-
     Err(format!(
         "Cannot find mihomo binary '{}'. Place it in src-tauri/bin/",
         sidecar_name
@@ -108,7 +90,7 @@ fn find_mihomo_bin(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String>
 
 pub fn start_mihomo(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<CoreState>();
-    let mut guard = state.child.lock().unwrap();
+    let mut guard = state.child.lock().unwrap_or_else(|e| e.into_inner());
 
     // Clean up zombie process: child exists but has already exited
     if let Some(child) = guard.as_mut() {
@@ -145,7 +127,7 @@ pub fn start_mihomo(app: &tauri::AppHandle) -> Result<(), String> {
 
 pub fn stop_mihomo(app: &tauri::AppHandle) {
     let state = app.state::<CoreState>();
-    let mut guard = state.child.lock().unwrap();
+    let mut guard = state.child.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut child) = guard.take() {
         let _ = child.kill();
         let _ = child.wait();
@@ -154,15 +136,22 @@ pub fn stop_mihomo(app: &tauri::AppHandle) {
 }
 
 /// Hot-reload config via Mihomo REST API: PUT /configs with path to config.yaml.
+/// If Mihomo is not running (sidecar child is None) AND we're not in TUN mode,
+/// start it as a sidecar. In TUN mode, always use HTTP API since helper manages the process.
 pub fn reload_mihomo(app: &tauri::AppHandle) -> Result<(), String> {
+    let is_tun = crate::config::load_state().proxy_mode == crate::config::ProxyMode::Tun;
+    reload_mihomo_inner(app, is_tun)
+}
+
+fn reload_mihomo_inner(app: &tauri::AppHandle, is_tun: bool) -> Result<(), String> {
     let config_path = crate::config::config_file();
     if !config_path.exists() {
         return Err("config.yaml not found".to_string());
     }
 
-    {
+    if !is_tun {
         let state = app.state::<CoreState>();
-        let guard = state.child.lock().unwrap();
+        let guard = state.child.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             drop(guard);
             return start_mihomo(app);
@@ -177,16 +166,18 @@ pub fn reload_mihomo(app: &tauri::AppHandle) -> Result<(), String> {
         .build()
         .map_err(|e| format!("HTTP client build failed: {e}"))?;
 
-    match client
-        .put("http://127.0.0.1:9090/configs?force=true")
-        .header("Authorization", "Bearer ClashTiny")
+    let resp = client
+        .put(format!("{API_BASE}/configs?force=true"))
+        .header("Authorization", format!("Bearer {API_SECRET}"))
         .header("Content-Type", "application/json")
         .body(body)
         .send()
-    {
-        Ok(r) => println!("[ClashTiny] Reload response: {}", r.status()),
-        Err(e) => eprintln!("[ClashTiny] Reload failed: {e}"),
-    }
+        .map_err(|e| format!("Reload request failed: {e}"))?;
 
-    Ok(())
+    if resp.status().is_success() {
+        println!("[ClashTiny] Reload response: {}", resp.status());
+        Ok(())
+    } else {
+        Err(format!("Reload returned HTTP {}", resp.status()))
+    }
 }

@@ -20,6 +20,11 @@ use tauri::{
 struct AppData {
     state: Mutex<AppState>,
     mihomo_error: AtomicBool,
+    switching: AtomicBool, // #4: prevent concurrent mode switches
+}
+
+fn lock_state(m: &Mutex<AppState>) -> std::sync::MutexGuard<'_, AppState> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn main() {
@@ -32,16 +37,16 @@ fn main() {
         .manage(AppData {
             state: Mutex::new(initial_state),
             mihomo_error: AtomicBool::new(false),
+            switching: AtomicBool::new(false),
         })
         .manage(core_manager::CoreState::new())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // Sync auto_start state with actual LaunchAgent plist on disk
             {
                 let data = app.state::<AppData>();
-                let mut state = data.state.lock().unwrap();
+                let mut state = lock_state(&data.state);
                 let actual = autostart::is_enabled();
                 if state.auto_start != actual {
                     println!(
@@ -58,7 +63,7 @@ fn main() {
                 eprintln!("[ClashTiny] Failed to start mihomo: {e}");
             }
             let data = app.state::<AppData>();
-            let current = data.state.lock().unwrap().clone();
+            let current = lock_state(&data.state).clone();
             match current.proxy_mode {
                 ProxyMode::SystemProxy => {
                     if let Err(e) = proxy_manager::enable_system_proxy() {
@@ -66,30 +71,23 @@ fn main() {
                     }
                 }
                 ProxyMode::Tun => {
-                    // TUN mode persists via helper LaunchDaemon (always running).
-                    // Only need to ensure the sidecar doesn't also start.
-                    // The sidecar was already started above; stop it and use helper.
                     if helper_manager::is_helper_installed() && helper_manager::is_helper_running() {
                         core_manager::stop_mihomo(app.handle());
                         let _ = config::set_tun_enabled(true);
-                        let arch = std::env::consts::ARCH;
-                        let sidecar = format!("mihomo-{}-apple-darwin", arch);
-                        let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                            .join("bin")
-                            .join(&sidecar);
-                        let bin = if dev.exists() {
-                            dev.to_string_lossy().to_string()
-                        } else {
-                            String::new()
-                        };
-                        if !bin.is_empty() {
-                            let cdir = config::config_dir().to_string_lossy().to_string();
-                            let _ = helper_manager::start_mihomo_via_helper(&bin, &cdir);
+                        // #3: use shared find_mihomo_bin instead of hardcoded dev path
+                        match core_manager::find_mihomo_bin(app.handle()) {
+                            Ok(bin) => {
+                                let cdir = config::config_dir().to_string_lossy().to_string();
+                                let _ = helper_manager::start_mihomo_via_helper(
+                                    &bin.to_string_lossy(),
+                                    &cdir,
+                                );
+                            }
+                            Err(e) => eprintln!("[ClashTiny] Cannot find mihomo for TUN: {e}"),
                         }
                     } else {
                         eprintln!("[ClashTiny] TUN mode saved but helper not running, falling back to None");
-                        let data2 = app.state::<AppData>();
-                        let mut s = data2.state.lock().unwrap();
+                        let mut s = lock_state(&data.state);
                         s.proxy_mode = ProxyMode::None;
                         config::save_state(&s);
                     }
@@ -99,8 +97,6 @@ fn main() {
 
             start_watchdog(app.handle().clone());
 
-            // Pre-warm tray menu: rebuild after a short delay to avoid
-            // macOS NSStatusItem first-click flicker.
             let warmup_handle = app.handle().clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(300));
@@ -134,7 +130,7 @@ fn get_tray_icon(mode: &ProxyMode, is_error: bool) -> Image<'static> {
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let menu = build_menu(app)?;
     let data = app.state::<AppData>();
-    let mode = data.state.lock().unwrap().proxy_mode.clone();
+    let mode = lock_state(&data.state).proxy_mode.clone();
     let is_error = data.mihomo_error.load(Ordering::Relaxed);
     let icon = get_tray_icon(&mode, is_error);
 
@@ -154,7 +150,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
 fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     let state = app.state::<AppData>();
-    let current = state.state.lock().unwrap().clone();
+    let current = lock_state(&state.state).clone();
 
     let sub_submenu = build_subscription_submenu(app, &current)?;
 
@@ -266,7 +262,7 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
 
                 {
                     let data = app.state::<AppData>();
-                    let mut state = data.state.lock().unwrap();
+                    let mut state = lock_state(&data.state);
                     state.active_profile = Some(input.name);
                     config::save_state(&state);
                 }
@@ -295,7 +291,7 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
 
         "auto_start" => {
             let data = app.state::<AppData>();
-            let current = data.state.lock().unwrap().auto_start;
+            let current = lock_state(&data.state).auto_start;
             let result = if current {
                 autostart::disable()
             } else {
@@ -303,7 +299,7 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
             };
             match result {
                 Ok(()) => {
-                    let mut state = data.state.lock().unwrap();
+                    let mut state = lock_state(&data.state);
                     state.auto_start = !current;
                     config::save_state(&state);
                 }
@@ -323,9 +319,10 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
             show_about_dialog();
         }
 
+        // #5: use app.exit() instead of std::process::exit() to run destructors
         "quit" => {
             let data = app.state::<AppData>();
-            let mode = data.state.lock().unwrap().proxy_mode.clone();
+            let mode = lock_state(&data.state).proxy_mode.clone();
             match mode {
                 ProxyMode::SystemProxy => {
                     let _ = proxy_manager::disable_system_proxy();
@@ -337,7 +334,7 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
                 ProxyMode::None => {}
             }
             core_manager::stop_mihomo(app);
-            std::process::exit(0);
+            app.exit(0);
         }
 
         _ => {}
@@ -348,18 +345,27 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
 // Actions
 // ---------------------------------------------------------------------------
 
-/// Mode switching rules:
-/// - To None: just teardown current mode.
-/// - To SystemProxy: try enable first; on success teardown old; on failure keep old.
-/// - To Tun: try setup first (async); on success teardown old; on failure keep old.
+struct SwitchingGuard<'a>(&'a AtomicBool);
+impl Drop for SwitchingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 fn set_proxy_mode(app: &tauri::AppHandle, mode: ProxyMode) {
-    let old = {
-        let data = app.state::<AppData>();
-        let m = data.state.lock().unwrap().proxy_mode.clone();
-        m
-    };
+    let data = app.state::<AppData>();
+
+    // #4: prevent concurrent mode switches
+    if data.switching.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        eprintln!("[ClashTiny] Mode switch already in progress, ignoring");
+        let _ = rebuild_tray(app);
+        return;
+    }
+
+    let old = lock_state(&data.state).proxy_mode.clone();
 
     if old == mode {
+        data.switching.store(false, Ordering::SeqCst);
         let _ = rebuild_tray(app);
         return;
     }
@@ -368,21 +374,27 @@ fn set_proxy_mode(app: &tauri::AppHandle, mode: ProxyMode) {
         ProxyMode::None => {
             teardown_mode(app, &old);
             save_and_rebuild(app, ProxyMode::None);
+            data.switching.store(false, Ordering::SeqCst);
         }
         ProxyMode::SystemProxy => {
             if let Err(e) = proxy_manager::enable_system_proxy() {
                 eprintln!("[ClashTiny] Enable system proxy failed: {e}");
                 show_error_dialog(&format!("开启系统代理失败：{}", e));
+                data.switching.store(false, Ordering::SeqCst);
                 let _ = rebuild_tray(app);
                 return;
             }
             teardown_mode(app, &old);
             save_and_rebuild(app, ProxyMode::SystemProxy);
+            data.switching.store(false, Ordering::SeqCst);
         }
         ProxyMode::Tun => {
             let app_clone = app.clone();
             let old_clone = old.clone();
             std::thread::spawn(move || {
+                let data = app_clone.state::<AppData>();
+                // A: Drop guard ensures switching is reset even on panic
+                let _guard = SwitchingGuard(&data.switching);
                 match setup_tun(&app_clone) {
                     Ok(()) => {
                         teardown_mode(&app_clone, &old_clone);
@@ -401,14 +413,13 @@ fn set_proxy_mode(app: &tauri::AppHandle, mode: ProxyMode) {
 fn save_and_rebuild(app: &tauri::AppHandle, mode: ProxyMode) {
     let data = app.state::<AppData>();
     {
-        let mut state = data.state.lock().unwrap();
+        let mut state = lock_state(&data.state);
         state.proxy_mode = mode;
         config::save_state(&state);
     }
     let _ = rebuild_tray(app);
 }
 
-/// Teardown a specific proxy mode (without touching state).
 fn teardown_mode(app: &tauri::AppHandle, mode: &ProxyMode) {
     match mode {
         ProxyMode::SystemProxy => {
@@ -426,13 +437,11 @@ fn teardown_mode(app: &tauri::AppHandle, mode: &ProxyMode) {
 }
 
 fn setup_tun(app: &tauri::AppHandle) -> Result<(), String> {
-    // Phase 1: ensure helper is installed and running (no side effects on current mode)
     if !helper_manager::is_helper_installed() {
         println!("[ClashTiny] Helper not installed, prompting installation...");
         helper_manager::install_helper()?;
     }
 
-    // Wait for helper to start (LaunchDaemon may need a moment)
     let mut helper_ready = false;
     for i in 0..10 {
         if helper_manager::is_helper_running() {
@@ -446,14 +455,15 @@ fn setup_tun(app: &tauri::AppHandle) -> Result<(), String> {
         return Err("Helper 服务未能启动，请检查 /tmp/clash-tiny-helper.log".to_string());
     }
 
-    // Phase 2: switch Mihomo to root mode with TUN
     core_manager::stop_mihomo(app);
     config::set_tun_enabled(true)?;
 
-    let bin_path = find_mihomo_for_helper(app)?;
+    // #3: use shared find_mihomo_bin instead of hardcoded dev path
+    let bin_path = core_manager::find_mihomo_bin(app)?;
+    let bin_str = bin_path.to_string_lossy().to_string();
     let config_dir = config::config_dir().to_string_lossy().to_string();
 
-    let resp = helper_manager::start_mihomo_via_helper(&bin_path, &config_dir)?;
+    let resp = helper_manager::start_mihomo_via_helper(&bin_str, &config_dir)?;
     if resp.code != 0 {
         let _ = config::set_tun_enabled(false);
         let _ = core_manager::start_mihomo(app);
@@ -462,37 +472,6 @@ fn setup_tun(app: &tauri::AppHandle) -> Result<(), String> {
 
     println!("[ClashTiny] TUN mode enabled via helper: {}", resp.message);
     Ok(())
-}
-
-fn find_mihomo_for_helper(app: &tauri::AppHandle) -> Result<String, String> {
-    let arch = std::env::consts::ARCH;
-    let sidecar_name = format!("mihomo-{}-apple-darwin", arch);
-
-    let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("bin")
-        .join(&sidecar_name);
-    if dev_path.exists() {
-        return Ok(dev_path.to_string_lossy().to_string());
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        let real_exe = exe.canonicalize().unwrap_or(exe);
-        if let Some(dir) = real_exe.parent() {
-            let prod_path = dir.join(&sidecar_name);
-            if prod_path.exists() {
-                return Ok(prod_path.to_string_lossy().to_string());
-            }
-        }
-    }
-
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        let res_path = resource_dir.join(&sidecar_name);
-        if res_path.exists() {
-            return Ok(res_path.to_string_lossy().to_string());
-        }
-    }
-
-    Err(format!("找不到 mihomo 二进制: {sidecar_name}"))
 }
 
 fn switch_profile(app: &tauri::AppHandle, name: &str) {
@@ -507,7 +486,7 @@ fn switch_profile(app: &tauri::AppHandle, name: &str) {
 
     {
         let data = app.state::<AppData>();
-        let mut state = data.state.lock().unwrap();
+        let mut state = lock_state(&data.state);
         state.active_profile = Some(name.to_string());
         config::save_state(&state);
     }
@@ -520,7 +499,7 @@ fn rebuild_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         tray.set_menu(Some(menu))?;
 
         let data = app.state::<AppData>();
-        let mode = data.state.lock().unwrap().proxy_mode.clone();
+        let mode = lock_state(&data.state).proxy_mode.clone();
         let is_error = data.mihomo_error.load(Ordering::Relaxed);
         let icon = get_tray_icon(&mode, is_error);
         tray.set_icon(Some(icon))?;
@@ -539,7 +518,6 @@ fn start_watchdog(app: tauri::AppHandle) {
         let mut consecutive_failures: u32 = 0;
         const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
         const FAILURE_THRESHOLD: u32 = 3;
-        // If actual elapsed time exceeds expected sleep by this much, assume wake from sleep
         const WAKE_TOLERANCE: std::time::Duration = std::time::Duration::from_secs(20);
 
         loop {
@@ -549,15 +527,12 @@ fn start_watchdog(app: tauri::AppHandle) {
 
             let data = app.state::<AppData>();
 
-            // Detect wake from sleep: if we slept much longer than expected,
-            // the system was suspended in between.
             if elapsed > CHECK_INTERVAL + WAKE_TOLERANCE {
                 println!(
                     "[Watchdog] Wake from sleep detected (slept {}s, expected {}s)",
                     elapsed.as_secs(),
                     CHECK_INTERVAL.as_secs()
                 );
-                // Brief delay to let network stack stabilize
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 handle_wake_recovery(&app, &data);
                 consecutive_failures = 0;
@@ -591,33 +566,29 @@ fn start_watchdog(app: tauri::AppHandle) {
             eprintln!("[Watchdog] Threshold reached, attempting recovery...");
             consecutive_failures = 0;
 
-            let mode = {
-                let m = data.state.lock().unwrap().proxy_mode.clone();
-                m
-            };
+            let mode = lock_state(&data.state).proxy_mode.clone();
 
             match mode {
+                // #3: use shared find_mihomo_bin for watchdog TUN recovery
                 ProxyMode::Tun => {
                     if helper_manager::is_helper_running() {
-                        let arch = std::env::consts::ARCH;
-                        let sidecar = format!("mihomo-{}-apple-darwin", arch);
-                        let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                            .join("bin")
-                            .join(&sidecar);
-                        if dev.exists() {
-                            let bin = dev.to_string_lossy().to_string();
-                            let cdir = config::config_dir().to_string_lossy().to_string();
-                            let _ = helper_manager::stop_mihomo_via_helper();
-                            let _ = config::set_tun_enabled(true);
-                            match helper_manager::start_mihomo_via_helper(&bin, &cdir) {
-                                Ok(r) if r.code == 0 => {
-                                    println!("[Watchdog] TUN Mihomo restarted: {}", r.message);
-                                    data.mihomo_error.store(false, Ordering::Relaxed);
-                                    let _ = rebuild_tray(&app);
+                        match core_manager::find_mihomo_bin(&app) {
+                            Ok(bin) => {
+                                let bin_str = bin.to_string_lossy().to_string();
+                                let cdir = config::config_dir().to_string_lossy().to_string();
+                                let _ = helper_manager::stop_mihomo_via_helper();
+                                let _ = config::set_tun_enabled(true);
+                                match helper_manager::start_mihomo_via_helper(&bin_str, &cdir) {
+                                    Ok(r) if r.code == 0 => {
+                                        println!("[Watchdog] TUN Mihomo restarted: {}", r.message);
+                                        data.mihomo_error.store(false, Ordering::Relaxed);
+                                        let _ = rebuild_tray(&app);
+                                    }
+                                    Ok(r) => eprintln!("[Watchdog] Restart failed: {}", r.message),
+                                    Err(e) => eprintln!("[Watchdog] Restart error: {e}"),
                                 }
-                                Ok(r) => eprintln!("[Watchdog] Restart failed: {}", r.message),
-                                Err(e) => eprintln!("[Watchdog] Restart error: {e}"),
                             }
+                            Err(e) => eprintln!("[Watchdog] Cannot find mihomo binary: {e}"),
                         }
                     }
                 }
@@ -637,34 +608,38 @@ fn start_watchdog(app: tauri::AppHandle) {
     });
 }
 
-/// Re-establish proxy after system wake from sleep.
 fn handle_wake_recovery(app: &tauri::AppHandle, data: &tauri::State<'_, AppData>) {
-    let mode = data.state.lock().unwrap().proxy_mode.clone();
+    let mode = lock_state(&data.state).proxy_mode.clone();
     println!("[Watchdog] Wake recovery for mode: {:?}", mode);
 
     match mode {
         ProxyMode::Tun => {
-            // Restart root Mihomo via helper to re-establish TUN interface & routes
             if helper_manager::is_helper_running() {
                 let _ = helper_manager::stop_mihomo_via_helper();
                 std::thread::sleep(std::time::Duration::from_secs(1));
 
                 let _ = config::set_tun_enabled(true);
-                if let Ok(bin) = find_mihomo_for_helper(app) {
-                    let cdir = config::config_dir().to_string_lossy().to_string();
-                    match helper_manager::start_mihomo_via_helper(&bin, &cdir) {
-                        Ok(r) if r.code == 0 => {
-                            println!("[Watchdog] TUN recovered after wake: {}", r.message);
-                            data.mihomo_error.store(false, Ordering::Relaxed);
+                match core_manager::find_mihomo_bin(app) {
+                    Ok(bin) => {
+                        let cdir = config::config_dir().to_string_lossy().to_string();
+                        match helper_manager::start_mihomo_via_helper(&bin.to_string_lossy(), &cdir) {
+                            Ok(r) if r.code == 0 => {
+                                println!("[Watchdog] TUN recovered after wake: {}", r.message);
+                                data.mihomo_error.store(false, Ordering::Relaxed);
+                            }
+                            Ok(r) => {
+                                eprintln!("[Watchdog] TUN recovery failed: {}", r.message);
+                                data.mihomo_error.store(true, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                eprintln!("[Watchdog] TUN recovery error: {e}");
+                                data.mihomo_error.store(true, Ordering::Relaxed);
+                            }
                         }
-                        Ok(r) => {
-                            eprintln!("[Watchdog] TUN recovery failed: {}", r.message);
-                            data.mihomo_error.store(true, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            eprintln!("[Watchdog] TUN recovery error: {e}");
-                            data.mihomo_error.store(true, Ordering::Relaxed);
-                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[Watchdog] Cannot find mihomo binary: {e}");
+                        data.mihomo_error.store(true, Ordering::Relaxed);
                     }
                 }
             } else {
@@ -674,11 +649,9 @@ fn handle_wake_recovery(app: &tauri::AppHandle, data: &tauri::State<'_, AppData>
             let _ = rebuild_tray(app);
         }
         ProxyMode::SystemProxy => {
-            // Re-apply system proxy settings (may have been cleared on wake)
             if let Err(e) = proxy_manager::enable_system_proxy() {
                 eprintln!("[Watchdog] System proxy recovery failed: {e}");
             }
-            // Also restart sidecar Mihomo to refresh connections
             core_manager::stop_mihomo(app);
             match core_manager::start_mihomo(app) {
                 Ok(()) => {
@@ -693,15 +666,19 @@ fn handle_wake_recovery(app: &tauri::AppHandle, data: &tauri::State<'_, AppData>
             let _ = rebuild_tray(app);
         }
         ProxyMode::None => {
-            // Still restart sidecar to refresh its state
             core_manager::stop_mihomo(app);
             let _ = core_manager::start_mihomo(app);
         }
     }
 }
 
+// #9: proper escaping for AppleScript double-quoted strings
+fn escape_for_applescript(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn show_error_dialog(msg: &str) {
-    let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"").replace('\'', "'");
+    let escaped = escape_for_applescript(msg);
     let script = format!(
         r#"tell application "System Events" to activate
 display dialog "{}" with title "Clash Tiny" buttons {{"确定"}} default button "确定" with icon stop"#,
@@ -715,8 +692,12 @@ display dialog "{}" with title "Clash Tiny" buttons {{"确定"}} default button 
 
 fn show_about_dialog() {
     let app_version = env!("CARGO_PKG_VERSION");
+    // B: sanitize version string to prevent JXA injection
     let mihomo_version = core_manager::get_mihomo_version()
-        .unwrap_or_else(|| "未运行".to_string());
+        .unwrap_or_else(|| "未运行".to_string())
+        .replace('\\', "")
+        .replace('"', "'")
+        .replace(')', "");
 
     let script = format!(
         r#"ObjC.import('Cocoa');
@@ -733,7 +714,6 @@ alert.window.level = $.NSFloatingWindowLevel;
 
 app.activateIgnoringOtherApps(true);
 var response = alert.runModal;
-// NSAlertSecondButtonReturn = 1001
 response == 1001 ? "github" : "ok";"#
     );
     std::thread::spawn(move || {

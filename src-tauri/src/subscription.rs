@@ -1,7 +1,8 @@
 use crate::config;
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
+
+const DIALOG_SCRIPT: &str = include_str!("../scripts/subscription_dialog.js");
 
 pub struct SubscriptionInput {
     pub url: String,
@@ -12,12 +13,14 @@ pub struct SubscriptionInput {
 /// Launch native macOS dialog (JXA / osascript) with URL, name, and overwrite checkbox.
 /// Returns None if user cancelled or input is invalid.
 pub fn prompt_subscription_input() -> Option<SubscriptionInput> {
-    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("subscription_dialog.js");
+    let tmp = tempfile::Builder::new()
+        .suffix(".js")
+        .tempfile()
+        .ok()?;
+    fs::write(tmp.path(), DIALOG_SCRIPT).ok()?;
 
     let output = Command::new("osascript")
-        .args(["-l", "JavaScript", script_path.to_str()?])
+        .args(["-l", "JavaScript", &tmp.path().to_string_lossy()])
         .output()
         .ok()?;
 
@@ -35,7 +38,7 @@ pub fn prompt_subscription_input() -> Option<SubscriptionInput> {
     let name = sanitize_filename(parts[1].trim());
     let overwrite = parts[2].trim() == "1";
 
-    if url.is_empty() || !url.starts_with("http") || name.is_empty() {
+    if url.is_empty() || (!url.starts_with("http://") && !url.starts_with("https://")) || name.is_empty() {
         return None;
     }
 
@@ -45,7 +48,7 @@ pub fn prompt_subscription_input() -> Option<SubscriptionInput> {
 /// Full "add subscription" flow per docs/订阅和启动流程.md:
 ///   download → basic check → save original → merge with override → mihomo -t validate
 ///   → on success: overwrite config.yaml, clean temp
-///   → on failure: delete original + temp
+///   → on failure: restore backup + clean temp
 pub fn download_and_save(url: &str, name: &str, overwrite: bool) -> Result<(), String> {
     let profile_path = config::profiles_dir().join(format!("{}.yaml", name));
     let temp_path = config::profiles_dir().join(format!("_{}.yaml", name));
@@ -67,8 +70,19 @@ pub fn download_and_save(url: &str, name: &str, overwrite: bool) -> Result<(), S
 
     let content = resp.text().map_err(|e| format!("读取响应失败: {e}"))?;
 
-    if !content.contains("proxies") && !content.contains("proxy-groups") {
+    // #7: structural YAML validation instead of plain text search
+    let doc: serde_yaml::Value = serde_yaml::from_str(&content)
+        .map_err(|e| format!("下载内容不是有效 YAML: {e}"))?;
+    let has_proxies = doc.get("proxies").is_some() || doc.get("proxy-groups").is_some();
+    if !has_proxies {
         return Err("下载内容不是有效的 Clash 配置（缺少 proxies / proxy-groups）".to_string());
+    }
+
+    // #8: backup existing profile before overwriting
+    let backup_path = config::profiles_dir().join(format!("_{}_bak.yaml", name));
+    let had_existing = profile_path.exists();
+    if had_existing {
+        let _ = fs::copy(&profile_path, &backup_path);
     }
 
     fs::write(&profile_path, &content).map_err(|e| format!("保存订阅文件失败: {e}"))?;
@@ -77,21 +91,27 @@ pub fn download_and_save(url: &str, name: &str, overwrite: bool) -> Result<(), S
     fs::write(&temp_path, &merged).map_err(|e| format!("写入临时文件失败: {e}"))?;
 
     if let Err(e) = validate_config(&temp_path) {
-        let _ = fs::remove_file(&profile_path);
+        // Restore backup instead of deleting
+        if had_existing {
+            let _ = fs::rename(&backup_path, &profile_path);
+        } else {
+            let _ = fs::remove_file(&profile_path);
+        }
         let _ = fs::remove_file(&temp_path);
         return Err(format!("配置验证失败: {e}"));
     }
 
-    fs::copy(&temp_path, config::config_file())
+    let temp_content = fs::read(&temp_path).map_err(|e| format!("读取临时文件失败: {e}"))?;
+    config::atomic_write(&config::config_file(), &temp_content)
         .map_err(|e| format!("覆盖 config.yaml 失败: {e}"))?;
     let _ = fs::remove_file(&temp_path);
+    let _ = fs::remove_file(&backup_path);
 
     println!("[ClashTiny] Subscription saved and activated: {}", name);
     Ok(())
 }
 
 /// Switch to an existing profile: merge with override → overwrite config.yaml.
-/// No re-validation needed (already validated when first added).
 pub fn activate_profile(name: &str) -> Result<(), String> {
     let profile_path = config::profiles_dir().join(format!("{}.yaml", name));
     if !profile_path.exists() {
@@ -102,7 +122,7 @@ pub fn activate_profile(name: &str) -> Result<(), String> {
         .map_err(|e| format!("读取订阅失败: {e}"))?;
     let merged = merge_with_override(&content)?;
 
-    fs::write(config::config_file(), &merged)
+    config::atomic_write(&config::config_file(), merged.as_bytes())
         .map_err(|e| format!("写入 config.yaml 失败: {e}"))?;
 
     println!("[ClashTiny] Activated profile: {}", name);
@@ -114,7 +134,7 @@ fn merge_with_override(profile_yaml: &str) -> Result<String, String> {
 }
 
 fn validate_config(path: &std::path::Path) -> Result<(), String> {
-    let bin = find_mihomo_bin()?;
+    let bin = config::find_mihomo_bin_path()?;
 
     let output = Command::new(&bin)
         .args(["-t", "-f", &path.to_string_lossy()])
@@ -135,30 +155,6 @@ fn validate_config(path: &std::path::Path) -> Result<(), String> {
             .to_string();
         Err(summary)
     }
-}
-
-fn find_mihomo_bin() -> Result<PathBuf, String> {
-    let arch = std::env::consts::ARCH;
-    let sidecar_name = format!("mihomo-{}-apple-darwin", arch);
-
-    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("bin")
-        .join(&sidecar_name);
-    if dev_path.exists() {
-        return Ok(dev_path);
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        let real_exe = exe.canonicalize().unwrap_or(exe);
-        if let Some(dir) = real_exe.parent() {
-            let prod_path = dir.join(&sidecar_name);
-            if prod_path.exists() {
-                return Ok(prod_path);
-            }
-        }
-    }
-
-    Err("找不到 mihomo 二进制文件".to_string())
 }
 
 fn sanitize_filename(name: &str) -> String {

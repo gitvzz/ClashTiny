@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 const DEFAULT_OVERRIDE: &str = include_str!("../resources/override.yaml");
@@ -135,8 +136,20 @@ pub fn load_state() -> AppState {
 
 pub fn save_state(state: &AppState) {
     if let Ok(json) = serde_json::to_string_pretty(state) {
-        fs::write(state_file(), json).ok();
+        atomic_write(&state_file(), json.as_bytes()).ok();
     }
+}
+
+/// Write to a temp file then atomically rename, preventing partial writes.
+pub fn atomic_write(target: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    let dir = target.parent().unwrap_or(std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| format!("创建临时文件失败: {e}"))?;
+    tmp.write_all(data)
+        .map_err(|e| format!("写入临时文件失败: {e}"))?;
+    tmp.persist(target)
+        .map_err(|e| format!("原子替换失败: {e}"))?;
+    Ok(())
 }
 
 /// Toggle tun.enable in config.yaml. All other TUN/DNS fields come from override.yaml.
@@ -162,9 +175,35 @@ pub fn set_tun_enabled(enabled: bool) -> Result<(), String> {
     }
 
     let yaml = serde_yaml::to_string(&doc).map_err(|e| format!("序列化 config 失败: {e}"))?;
-    fs::write(&path, yaml).map_err(|e| format!("写入 config.yaml 失败: {e}"))?;
+    atomic_write(&path, yaml.as_bytes()).map_err(|e| format!("写入 config.yaml 失败: {e}"))?;
     println!("[ClashTiny] tun.enable set to {enabled}");
     Ok(())
+}
+
+/// Locate the mihomo binary. Checks dev path, then exe-relative path.
+/// For production with Tauri resource_dir fallback, use core_manager::find_mihomo_bin().
+pub fn find_mihomo_bin_path() -> Result<PathBuf, String> {
+    let arch = std::env::consts::ARCH;
+    let sidecar_name = format!("mihomo-{}-apple-darwin", arch);
+
+    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("bin")
+        .join(&sidecar_name);
+    if dev_path.exists() {
+        return Ok(dev_path);
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        let real_exe = exe.canonicalize().unwrap_or(exe);
+        if let Some(dir) = real_exe.parent() {
+            let prod_path = dir.join(&sidecar_name);
+            if prod_path.exists() {
+                return Ok(prod_path);
+            }
+        }
+    }
+
+    Err(format!("找不到 mihomo 二进制: {sidecar_name}"))
 }
 
 /// List profiles in profiles/, excluding temp files (prefixed with _).

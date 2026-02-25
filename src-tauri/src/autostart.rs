@@ -4,13 +4,13 @@ use std::process::Command;
 
 const PLIST_LABEL: &str = "com.clash-tiny.app";
 
-fn plist_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join("Library").join("LaunchAgents")
+fn plist_dir() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("无法获取 HOME 目录")?;
+    Ok(home.join("Library").join("LaunchAgents"))
 }
 
-fn plist_path() -> PathBuf {
-    plist_dir().join(format!("{PLIST_LABEL}.plist"))
+fn plist_path() -> Result<PathBuf, String> {
+    Ok(plist_dir()?.join(format!("{PLIST_LABEL}.plist")))
 }
 
 fn xml_escape(s: &str) -> String {
@@ -45,17 +45,15 @@ fn build_plist() -> Result<String, String> {
     ))
 }
 
-/// Check whether the LaunchAgent plist actually exists on disk.
 pub fn is_enabled() -> bool {
-    plist_path().exists()
+    plist_path().map(|p| p.exists()).unwrap_or(false)
 }
 
-/// Create the LaunchAgent plist and load it into the current session.
 pub fn enable() -> Result<(), String> {
-    let dir = plist_dir();
+    let dir = plist_dir()?;
     fs::create_dir_all(&dir).map_err(|e| format!("创建 LaunchAgents 目录失败: {e}"))?;
 
-    let path = plist_path();
+    let path = plist_path()?;
     let content = build_plist()?;
     fs::write(&path, &content).map_err(|e| format!("写入 plist 失败: {e}"))?;
 
@@ -76,9 +74,8 @@ pub fn enable() -> Result<(), String> {
     Ok(())
 }
 
-/// Unload the LaunchAgent from the current session and remove the plist.
 pub fn disable() -> Result<(), String> {
-    let path = plist_path();
+    let path = plist_path()?;
     if !path.exists() {
         return Ok(());
     }
