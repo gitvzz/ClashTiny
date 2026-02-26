@@ -740,7 +740,7 @@ response == 1001 ? "github" : "ok";"#
         if let Ok(out) = output {
             let result = String::from_utf8_lossy(&out.stdout);
             if result.trim() == "github" {
-                let _ = open::that("https://github.com/netfere/ClashTiny");
+                let _ = open::that("https://github.com/gitvzz/ClashTiny");
             }
         }
     });
