@@ -68,30 +68,6 @@ pub fn install_helper() -> Result<(), String> {
     }
 }
 
-pub fn uninstall_helper() -> Result<(), String> {
-    let uninstall_script = find_uninstall_script()?;
-
-    let esc = |p: &Path| p.to_string_lossy().replace('\'', "'\\''");
-    let script = format!(
-        r#"do shell script "bash '{}'" with administrator privileges"#,
-        esc(&uninstall_script),
-    );
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .map_err(|e| format!("Failed to run osascript: {e}"))?;
-
-    if output.status.success() {
-        println!("[ClashTiny] Helper uninstalled");
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("卸载失败: {}", stderr.trim()))
-    }
-}
-
 /// Start Mihomo via helper (root) with the given binary path and config dir.
 pub fn start_mihomo_via_helper(bin_path: &str, config_dir: &str) -> Result<HelperResponse, String> {
     send_command(
@@ -220,18 +196,4 @@ fn find_install_script() -> Result<PathBuf, String> {
     }
 
     Err("找不到 install.sh 脚本".to_string())
-}
-
-fn find_uninstall_script() -> Result<PathBuf, String> {
-    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("helper")
-        .join("scripts")
-        .join("uninstall.sh");
-    if dev_path.exists() {
-        return Ok(dev_path);
-    }
-
-    Err("找不到 uninstall.sh 脚本".to_string())
 }
