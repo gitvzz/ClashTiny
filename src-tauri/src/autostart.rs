@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 const PLIST_LABEL: &str = "com.clash-tiny.app";
 
@@ -57,18 +56,9 @@ pub fn enable() -> Result<(), String> {
     let content = build_plist()?;
     fs::write(&path, &content).map_err(|e| format!("写入 plist 失败: {e}"))?;
 
-    let output = Command::new("launchctl")
-        .args(["load", &path.to_string_lossy()])
-        .output()
-        .map_err(|e| format!("执行 launchctl load 失败: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("already loaded") && !stderr.contains("Already loaded") {
-            let _ = fs::remove_file(&path);
-            return Err(format!("launchctl load 失败: {}", stderr.trim()));
-        }
-    }
+    // Don't call `launchctl load` — it would immediately start a second instance
+    // because RunAtLoad=true. macOS automatically loads plists from
+    // ~/Library/LaunchAgents/ on next login.
 
     println!("[ClashTiny] Auto-start enabled: {}", path.display());
     Ok(())
@@ -79,10 +69,6 @@ pub fn disable() -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
-
-    let _ = Command::new("launchctl")
-        .args(["unload", &path.to_string_lossy()])
-        .output();
 
     fs::remove_file(&path).map_err(|e| format!("删除 plist 失败: {e}"))?;
 

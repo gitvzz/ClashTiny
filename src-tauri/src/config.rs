@@ -84,7 +84,7 @@ pub fn ensure_default_files() {
             let profile_path = profiles_dir().join(format!("{}.yaml", profile_name));
             if profile_path.exists() {
                 if let Ok(profile_content) = fs::read_to_string(&profile_path) {
-                    if let Ok(merged) = merge_profile_with_override(&profile_content) {
+                    if let Ok(merged) = apply_override(&profile_content) {
                         fs::write(&config, &merged).ok();
                         println!(
                             "[ClashTiny] Rebuilt config.yaml from profile '{}' + override",
@@ -102,24 +102,149 @@ pub fn ensure_default_files() {
     }
 }
 
-/// Merge a profile YAML string with override.yaml (override wins for shared keys).
-pub fn merge_profile_with_override(profile_yaml: &str) -> Result<String, String> {
+/// Apply override.yaml on top of a base YAML config (subscription).
+/// Implements 4-level merge strategy per docs/配置.md:
+///   Level 1: mandatory fields (forced override)
+///   Level 2: tun (override base + whitelist from subscription)
+///   Level 3: dns (subscription priority + locked fields + fill missing)
+///   Level 4: geox-url (override base + subscription overwrites)
+pub fn apply_override(base_yaml: &str) -> Result<String, String> {
     let override_content = fs::read_to_string(override_file())
         .map_err(|e| format!("读取 override.yaml 失败: {e}"))?;
 
-    let mut profile: serde_yaml::Value = serde_yaml::from_str(profile_yaml)
-        .map_err(|e| format!("解析订阅配置失败: {e}"))?;
-
+    let mut base: serde_yaml::Value = serde_yaml::from_str(base_yaml)
+        .map_err(|e| format!("解析基础配置失败: {e}"))?;
     let overrides: serde_yaml::Value = serde_yaml::from_str(&override_content)
-        .map_err(|e| format!("解析 override.yaml 失败: {e}"))?;
+        .map_err(|e| format!("解析覆盖配置失败: {e}"))?;
 
-    if let (Some(p_map), Some(o_map)) = (profile.as_mapping_mut(), overrides.as_mapping()) {
-        for (key, value) in o_map {
-            p_map.insert(key.clone(), value.clone());
+    let base_map = base
+        .as_mapping_mut()
+        .ok_or("基础配置不是有效的 YAML mapping")?;
+    let override_map = overrides
+        .as_mapping()
+        .ok_or("覆盖配置不是有效的 YAML mapping")?;
+
+    let is_tun = load_state().proxy_mode == ProxyMode::Tun;
+
+    merge_level1_mandatory(base_map, override_map);
+    merge_level2_tun(base_map, override_map, is_tun);
+    merge_level3_dns(base_map, override_map);
+    merge_level4_geox(base_map, override_map);
+
+    serde_yaml::to_string(&base).map_err(|e| format!("序列化合并配置失败: {e}"))
+}
+
+fn ykey(s: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(s.to_string())
+}
+
+/// Level 1: force override mandatory fields (program depends on these exact values).
+fn merge_level1_mandatory(
+    base: &mut serde_yaml::Mapping,
+    overrides: &serde_yaml::Mapping,
+) {
+    const MANDATORY_KEYS: &[&str] = &[
+        "mixed-port",
+        "external-controller",
+        "secret",
+        "external-ui",
+        "external-ui-url",
+    ];
+    for &k in MANDATORY_KEYS {
+        let key = ykey(k);
+        if let Some(val) = overrides.get(&key) {
+            base.insert(key, val.clone());
+        }
+    }
+}
+
+/// Level 2: tun — override as base, only whitelist fields from subscription.
+/// Injects tun.enable based on current runtime proxy mode.
+fn merge_level2_tun(
+    base: &mut serde_yaml::Mapping,
+    overrides: &serde_yaml::Mapping,
+    is_tun: bool,
+) {
+    const TUN_WHITELIST: &[&str] = &["mtu", "udp-timeout"];
+    let tun_key = ykey("tun");
+
+    let mut tun = overrides
+        .get(&tun_key)
+        .and_then(|v| v.as_mapping())
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(sub_tun) = base.get(&tun_key).and_then(|v| v.as_mapping()) {
+        for &field in TUN_WHITELIST {
+            let k = ykey(field);
+            if let Some(val) = sub_tun.get(&k) {
+                tun.insert(k, val.clone());
+            }
         }
     }
 
-    serde_yaml::to_string(&profile).map_err(|e| format!("序列化合并配置失败: {e}"))
+    tun.insert(ykey("enable"), serde_yaml::Value::Bool(is_tun));
+
+    base.insert(tun_key, serde_yaml::Value::Mapping(tun));
+}
+
+/// Level 3: dns — subscription priority; lock enable/listen; fill missing from override.
+fn merge_level3_dns(
+    base: &mut serde_yaml::Mapping,
+    overrides: &serde_yaml::Mapping,
+) {
+    let dns_key = ykey("dns");
+
+    let mut result = if let Some(sub_dns) = base.get(&dns_key).and_then(|v| v.as_mapping()) {
+        let mut r = sub_dns.clone();
+        // Fill missing fields from override's dns defaults
+        if let Some(ov_dns) = overrides.get(&dns_key).and_then(|v| v.as_mapping()) {
+            for (k, v) in ov_dns {
+                if !r.contains_key(k) {
+                    r.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        r
+    } else {
+        // No DNS in subscription — use override's dns entirely
+        overrides
+            .get(&dns_key)
+            .and_then(|v| v.as_mapping())
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // Lock mandatory dns fields
+    result.insert(ykey("enable"), serde_yaml::Value::Bool(true));
+    result.insert(
+        ykey("listen"),
+        serde_yaml::Value::String("0.0.0.0:1053".to_string()),
+    );
+
+    base.insert(dns_key, serde_yaml::Value::Mapping(result));
+}
+
+/// Level 4: geox-url — override as base, subscription fields overwrite.
+fn merge_level4_geox(
+    base: &mut serde_yaml::Mapping,
+    overrides: &serde_yaml::Mapping,
+) {
+    let geox_key = ykey("geox-url");
+
+    let mut geox = overrides
+        .get(&geox_key)
+        .and_then(|v| v.as_mapping())
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(sub_geox) = base.get(&geox_key).and_then(|v| v.as_mapping()) {
+        for (k, v) in sub_geox {
+            geox.insert(k.clone(), v.clone());
+        }
+    }
+
+    base.insert(geox_key, serde_yaml::Value::Mapping(geox));
 }
 
 pub fn load_state() -> AppState {

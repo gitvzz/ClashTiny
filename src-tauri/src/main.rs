@@ -6,6 +6,7 @@ mod core_manager;
 mod helper_manager;
 mod proxy_manager;
 mod subscription;
+mod uninstall;
 
 use config::{AppState, ProxyMode};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -180,11 +181,15 @@ fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::
         .build(app)?;
     let open_config_dir = MenuItemBuilder::with_id("open_config_dir", "打开配置目录").build(app)?;
 
+    let uninstall = MenuItemBuilder::with_id("uninstall", "卸载").build(app)?;
+
     let settings_submenu = SubmenuBuilder::with_id(app, "settings", "设置")
         .item(&auto_start)
         .item(&global_override)
         .separator()
         .item(&open_config_dir)
+        .separator()
+        .item(&uninstall)
         .build()?;
 
     let about = MenuItemBuilder::with_id("about", "关于").build(app)?;
@@ -313,6 +318,15 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
 
         "open_config_dir" => {
             let _ = open::that(config::config_dir().to_string_lossy().as_ref());
+        }
+
+        "uninstall" => {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                if uninstall::confirm_uninstall() {
+                    uninstall::perform_uninstall(&app);
+                }
+            });
         }
 
         "about" => {

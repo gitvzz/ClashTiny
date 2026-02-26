@@ -87,7 +87,7 @@ pub fn download_and_save(url: &str, name: &str, overwrite: bool) -> Result<(), S
 
     fs::write(&profile_path, &content).map_err(|e| format!("保存订阅文件失败: {e}"))?;
 
-    let merged = merge_with_override(&content)?;
+    let merged = config::apply_override(&content)?;
     fs::write(&temp_path, &merged).map_err(|e| format!("写入临时文件失败: {e}"))?;
 
     if let Err(e) = validate_config(&temp_path) {
@@ -120,17 +120,13 @@ pub fn activate_profile(name: &str) -> Result<(), String> {
 
     let content = fs::read_to_string(&profile_path)
         .map_err(|e| format!("读取订阅失败: {e}"))?;
-    let merged = merge_with_override(&content)?;
+    let merged = config::apply_override(&content)?;
 
     config::atomic_write(&config::config_file(), merged.as_bytes())
         .map_err(|e| format!("写入 config.yaml 失败: {e}"))?;
 
     println!("[ClashTiny] Activated profile: {}", name);
     Ok(())
-}
-
-fn merge_with_override(profile_yaml: &str) -> Result<String, String> {
-    config::merge_profile_with_override(profile_yaml)
 }
 
 fn validate_config(path: &std::path::Path) -> Result<(), String> {
