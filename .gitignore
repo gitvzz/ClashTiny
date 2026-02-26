@@ -1,6 +1,7 @@
 # macOS
 .DS_Store
 docs
+scripts
 
 # Rust / Cargo
 **/target/
